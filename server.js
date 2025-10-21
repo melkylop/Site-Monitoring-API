@@ -3,13 +3,43 @@ const express = require("express");
 const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const axios = require("axios");
+require('dotenv').config();  // 👈🔥 ADICIONE ESTA LINHA AQUI
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;  // 👈🔥 MODIFIQUE ESTA LINHA
+
+// Middleware de autenticação Bearer Token
+const authMiddleware = (req, res, next) => {
+    // Não requer auth para health check e raiz
+    if (req.path === '/health' || req.path === '/') {
+        return next();
+    }
+    
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ 
+            error: 'Token de acesso necessário',
+            message: 'Use: Authorization: Bearer SEU_TOKEN'
+        });
+    }
+    
+    const token = authHeader.substring(7); // Remove "Bearer "
+    
+    if (token !== process.env.API_TOKEN) {
+        return res.status(403).json({ 
+            error: 'Token inválido',
+            message: 'Token de acesso incorreto'
+        });
+    }
+    
+    next();
+};
 
 // Middlewares
 app.use(cors());
 app.use(express.json());
+app.use('/api', authMiddleware); 
 
 // Configurar banco de dados
 const db = new sqlite3.Database("./database.db");
@@ -208,6 +238,16 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Health check para Kubernetes (/healthz)
+app.get("/healthz", (req, res) => {
+  res.status(200).json({ 
+    status: "healthy", 
+    timestamp: new Date().toISOString(),
+    service: "site-monitoring-api",
+    uptime: process.uptime()
+  });
+});
+
 // Listar todos os sites
 app.get("/api/sites", async (req, res) => {
   try {
@@ -321,11 +361,51 @@ app.get("/", (req, res) => {
 });
 
 // Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`🎉 SERVIDOR RODANDO NA PORTA ${PORT}`);
-  console.log(`📍 Health Check: http://localhost:${PORT}/health`);
-  console.log(`📍 API: http://localhost:${PORT}/api/sites`);
-  console.log(`📍 Webhook Test: http://localhost:${PORT}/api/sites/1/check`);
+const HOST = process.env.HOST || '127.0.0.1';
+const server = app.listen(PORT, HOST, () => {
+  console.log(`🎉 SERVIDOR RODANDO EM http://${HOST}:${PORT}`);
+  console.log(`📍 Health Check: http://${HOST}:${PORT}/health`);
+  console.log(`📍 API: http://${HOST}:${PORT}/api/sites`);
+  console.log(`📍 Webhook Test: http://${HOST}:${PORT}/api/sites/1/check`);
 
   startMonitoring();
+});
+
+// Graceful Shutdown
+const gracefulShutdown = (signal) => {
+  console.log(`\n🛑 Recebido ${signal}. Encerrando servidor graciosamente...`);
+  
+  server.close(() => {
+    console.log('✅ Servidor HTTP fechado.');
+    
+    // Fechar conexão com banco de dados
+    db.close((err) => {
+      if (err) {
+        console.error('Erro ao fechar banco de dados:', err);
+        process.exit(1);
+      }
+      console.log('✅ Conexão com banco de dados fechada.');
+      process.exit(0);
+    });
+  });
+
+  // Timeout forçado após 10 segundos
+  setTimeout(() => {
+    console.error('❌ Forçando encerramento após timeout...');
+    process.exit(1);
+  }, 10000);
+};
+
+// Listeners para os sinais de desligamento
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Manipular rejeições de promises não tratadas
+process.on('unhandledRejection', (err) => {
+  console.error('❌ Unhandled Promise Rejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err);
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
